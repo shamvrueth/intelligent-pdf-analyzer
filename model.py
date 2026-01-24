@@ -8,114 +8,168 @@ from sentence_transformers import SentenceTransformer
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from collections import defaultdict
+from pathlib import Path
+from datetime import datetime
+from openai import OpenAI
 
 class Model:
     def __init__(self, pdf_path):
         self.pdf_path = pdf_path
-
-    def get_page_word_boxes(self):
-        doc = fitz.open(self.pdf_path)
-        box = {}
-        for p in range(len(doc)):
-            page = doc[p]
-            words = page.get_text("words")
-            words = sorted(words, key=lambda w: (round(w[1],2), round(w[0],2)))
-            box[p] = words
-        return box
     
     def assign_span_sections(self, tp):
         sections = []
-        lines_by_page, outline_json = PDFOutline(self.pdf_path).analyse()     # returns JSON string
-        print(outline_json)
+        lines_by_page, outline_json = PDFOutline(self.pdf_path).analyse()
         outline = json.loads(outline_json)
         total_pages = tp - 1
-        n = len(outline["outline"])
-        l = []
-        k = 0
+        items = outline.get("outline", [])
+        n = len(items)
 
-        # add line index to lines_by_page
+        # index lines on each page
         for p in lines_by_page:
             for i, d in enumerate(lines_by_page[p]):
                 d["index"] = i
 
-        # add line index and in page index to outline
-        for i in range(n - 1):
-            if (outline["outline"][i]["page"] not in l):
-                k = 0
-                l.append(outline["outline"][i]["page"])
-            outline["outline"][i]["in_page_index"] = k
-            k += 1
-            
-            for j in lines_by_page[outline["outline"][i]["page"]]:
-                if (j["text"] == outline["outline"][i]["text"]):
-                    outline["outline"][i]["start_index"] = j["index"]
-                if (j["text"] == outline["outline"][i+1]["text"]):
-                    outline["outline"][i]["end_index"] = j["index"] - 1
+        def find_start_index(page, heading_text):
+            for line in lines_by_page.get(page, []):
+                if line.get("text", "").strip().lower() == heading_text.strip().lower():
+                    return line["index"]
+            return 0
 
-        print(outline)
-        if (outline["outline"][n-1]["page"] not in l):
-            outline["outline"][n-1]["in_page_index"] = 0
-        else:
-            outline["outline"][n-1]["in_page_index"] = k
-        outline["outline"][n-1]["start_index"] = outline["outline"][n-2]["end_index"]
-        outline["outline"][n-1]["end_index"] = len(lines_by_page[outline["outline"][n-1]["page"]]) - 1
-        
-        for i, h in enumerate(outline["outline"]):
-            s = {}
-            s["heading"] = h["text"]
-            s["level"] = h["level"]
-            s["start_page"] = h["page"]
+        # ensure every outline item has start_index
+        for item in items:
+            item["start_index"] = find_start_index(item.get("page"), item.get("text", ""))
+
+        # compute end_index and end_page robustly
+        for i, item in enumerate(items):
+            start_page = item.get("page")
+            start_index = item.get("start_index", 0)
+
             if i + 1 < n:
-                next_h = outline["outline"][i + 1]
-                if next_h["page"] == h["page"]:
-                    s["end_page"] = h["page"]
-                    s["end_after_in_page_index"] = next_h.get("in_page_index")
-                    s["end_index"] = next_h.get("start_index") - 1
-                else:
-                    s["end_page"] = next_h["page"]
-                    s["end_index"] = next_h.get("start_index") - 1
-            else:
-                s["end_page"] = total_pages
-            s["start_index"] = h["start_index"]
-            sections.append(s)
+                next_item = items[i + 1]
+                next_page = next_item.get("page")
+                next_start = next_item.get("start_index", None)
 
-        for s in sections:
+                if next_page == start_page:
+                    if next_start is None:
+                        # fallback to last line on page
+                        next_start = len(lines_by_page.get(start_page, []))
+                    end_index = max(0, next_start - 1)
+                    end_page = start_page
+                else:
+                    # next heading on later page
+                    if next_start is None:
+                        end_index = len(lines_by_page.get(next_page, [])) - 1 if lines_by_page.get(next_page) else 0
+                    else:
+                        end_index = max(0, next_start - 1)
+                    end_page = next_page
+            else:
+                # last heading: until end of document
+                end_page = total_pages
+                end_index = len(lines_by_page.get(end_page, [])) - 1 if lines_by_page.get(end_page) else 0
+
+            item["start_index"] = start_index
+            item["end_index"] = end_index
+            item["end_page"] = end_page
+
+        # build sections
+        for h in items:
+            s = {
+                "heading": h.get("text", ""),
+                "start_page": h.get("page"),
+                "end_page": h.get("end_page"),
+                "start_index": h.get("start_index", 0),
+                "end_index": h.get("end_index", 0)
+            }
+
             start = s["start_page"]
             end = s["end_page"]
-            if start == end and "end_after_in_page_index" in s and "end_index" in s:
+
+            if start == end:
                 lines = ""
-                for i in lines_by_page[start]:
-                    if (s["start_index"] > i["index"]):
+                for line in lines_by_page.get(start, []):
+                    if line["index"] < s["start_index"]:
                         continue
-                    if (i["index"] > s["end_index"]):
+                    if line["index"] > s["end_index"]:
                         break
-                    lines += " " + i["text"]
+                    lines += " " + line.get("text", "")
                 s["content"] = lines
-            elif "end_index" not in s:
-                t = []
-                lines = ""
-                for i in range(start, end + 1):
-                    for j in lines_by_page[i]:
-                        if (i == start and s["start_index"] > j["index"]):
-                            continue
-                        lines += " " + j["text"]
-                    t.append(lines)
-                s["content"] = "\n".join(t)
             else:
-                t = []
-                lines = ""
-                for i in range(start, end + 1):
-                    for j in lines_by_page[i]:
-                        if (i == start and s["start_index"] > j["index"]):
+                parts = []
+                for p in range(start, end + 1):
+                    lines = ""
+                    for line in lines_by_page.get(p, []):
+                        if p == start and line["index"] < s["start_index"]:
                             continue
-                        if (i == end and j["index"] > s["end_index"]):
+                        if p == end and line["index"] > s["end_index"]:
                             break
-                        lines += " " + j["text"]
-                    t.append(lines)
-                s["content"] = "\n".join(t)
-        
+                        lines += " " + line.get("text", "")
+                    parts.append(lines)
+                s["content"] = "\n".join(parts)
+
+            sections.append(s)
+
         return sections
     
+    # in case heasing detection for the document fails
+    def fallback_page_sections(self):
+        sections = []
+        lines_by_page, outline_json = PDFOutline(self.pdf_path).analyse()
+        for p, lines in lines_by_page.items():
+            text = " ".join(l["text"] for l in lines).strip()
+            if not text:
+                continue
+            sections.append({
+                "heading": f"Page {p+1}",
+                "start_page": p,
+                "end_page": p,
+                "content": text
+            })
+        return sections
+    
+    def split_into_sentences(self, text):
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        return [s.strip() for s in sentences if len(s.split()) >= 5]
+    
+    def semantic_chunk_sections(self, sections, min_words=60, max_words=120, overlap_sentences=1):
+        chunks = []
+
+        for i, s in enumerate(sections):
+            sentences = self.split_into_sentences(s["content"])
+            if not sentences:
+                continue
+
+            start = 0
+            chunk_id = 0
+
+            while start < len(sentences):
+                words = []
+                end = start
+
+                # pack sentences until max_words
+                while end < len(sentences):
+                    words.extend(sentences[end].split())
+                    if len(words) >= max_words:
+                        break
+                    end += 1
+
+                # enforce minimum length
+                if len(words) < min_words:
+                    break
+
+                chunk_text = " ".join(sentences[start:end + 1])
+
+                chunks.append({
+                    "chunk_id": f"s{i}_c{chunk_id}",
+                    "section_heading": s["heading"],
+                    "page_start": s["start_page"],
+                    "page_end": s["end_page"],
+                    "text": chunk_text
+                })
+
+                chunk_id += 1
+                start = max(start + 1, end - overlap_sentences)
+
+        return chunks
     def overlapping_chunk_sections(self, sections, chunk_size=300, overlap_ratio=0.3):
         chunks = []
         overlap = int(chunk_size * overlap_ratio)
@@ -134,7 +188,6 @@ class Model:
                 chunks.append({
                     "chunk_id": f"s{i}_c{id}",
                     "section_heading": s["heading"],
-                    "section_level": s["level"],
                     "page_start": s["start_page"],
                     "page_end": s["end_page"],
                     "text": chunk_text
@@ -147,31 +200,38 @@ class Model:
         return chunks
 
     def build_bm25_index(self, chunks):
-        tokenized_corpus = [c["text"].lower().split() for c in chunks]
-        bm25 = BM25Okapi(tokenized_corpus)
-        return bm25
+        def normalize(text):
+            text = text.lower()
+            text = re.sub(r"[^\w\s]", " ", text)
+            return text.split()
+
+        tokenized_corpus = [
+            normalize(c["text"])
+            for c in chunks
+        ]
+
+        return BM25Okapi(tokenized_corpus)
     
     def bm25_retrieve(self, bm25, chunks, query, top_k=200):
-        query = query.lower()
-        query = re.sub(r"[^\w\s]", " ", query)
+        query = re.sub(r"[^\w\s]", " ", query.lower())
         query_tokens = query.split()
+
         scores = bm25.get_scores(query_tokens)
         top_indices = np.argsort(scores)[::-1][:top_k]
 
-        results = []
-        for idx in top_indices:
-            results.append({
-                **chunks[idx],
-                "bm25_score": float(scores[idx])
-            })
-
-        return results
+        return [
+            {**chunks[i], "bm25_score": float(scores[i])}
+            for i in top_indices
+        ]
     
     def load_embedding_model(self, model_name="all-mpnet-base-v2"):
         self.embed_model = SentenceTransformer(model_name)
     
     def build_embedding_index(self, chunks, batch_size=32):
-        texts = [c["text"] for c in chunks]
+        texts = [
+            f"Section: {c['section_heading']}. Content: {c['text']}"
+            for c in chunks
+        ]
 
         embeddings = self.embed_model.encode(
             texts,
@@ -207,15 +267,20 @@ class Model:
         self.ce_model = AutoModelForSequenceClassification.from_pretrained(model_name).to("cpu")
         self.ce_model.eval()
     
-    def cross_encoder_rank(self, candidates, query, top_k=20, batch_size=8):
+    def cross_encoder_rank(self, candidates, query, persona, job, top_k=20, batch_size=8):
         scores = []
 
         with torch.no_grad():
             for i in range(0, len(candidates), batch_size):
                 batch = candidates[i:i + batch_size]
 
-                pairs = [(query, f"Section: {c['section_heading']}. Content: {c['text']}")
-                        for c in batch]
+                pairs = [
+                    (
+                        f"Persona: {persona}. Task: {job}. Query: {query}",
+                        f"Section title: {c['section_heading']}. Content: {c['text']}"
+                    )
+                    for c in batch
+                ]
 
                 encoded = self.ce_tokenizer(
                     pairs,
@@ -233,7 +298,9 @@ class Model:
                 for c, s in zip(batch, logits):
                     scores.append({
                         **c,
-                        "cross_score": float(s)
+                        "cross_score": float(s),
+                        "semantic_score": float(c["semantic_score"]),
+                        "bm25_score": float(c["bm25_score"])
                     })
 
         reranked = sorted(
@@ -253,13 +320,18 @@ class Model:
         sections = []
         for (heading, ps, pe), chunks in map.items():
             imp = max(c["cross_score"] for c in chunks)
+            cross = sum(c["cross_score"] for c in chunks) / len(chunks)
+            semantic = sum(c["semantic_score"] for c in chunks) / len(chunks)
+            bm25 = sum(c["bm25_score"] for c in chunks) / len(chunks)
             sections.append(
                 {
                     "section_heading": heading,
-                    # "section_level": chunks["section_level"],
                     "page_start": ps,
                     "page_end": pe,
                     "importance_score": imp,
+                    "cross_score": cross,
+                    "semantic_score": semantic,
+                    "bm25_score": bm25,
                     "chunks": chunks
                 }
             )
@@ -281,21 +353,285 @@ def merge(bm25, semantic):
         else:
             merged[r["chunk_id"]] = r
     for r in merged.values():
-        r.setdefault("bm25_score", 0.0)
         r.setdefault("semantic_score", 0.0)
+        r.setdefault("bm25_score", 0.0)
     return list(merged.values())
 
-# m = Model("./test/files/collection/South of France - Cuisine.pdf")
-# sections = m.assign_span_sections(14)
-# chunks = m.overlapping_chunk_sections(sections)
-# bm25 = m.build_bm25_index(chunks)
-# results = m.bm25_retrieve(bm25, chunks, "Le Louis XV")
-# m.load_embedding_model()
-# embeddings = m.build_embedding_index(chunks)
-# res = m.embedding_retrieve(embeddings, chunks, "Le Louis XV")
-# candidates = merge(results, res)
-# m.load_cross_encoder()
-# final = m.cross_encoder_rank(candidates, "Le Louis XV")
-# s = m.aggregate_chunk_into_sections(final)
-# print(s[:3])
 
+collections = [str(p) for p in Path("./test/files/collection2").glob("*.pdf")]
+
+p = Path("./test/files/collection2/json/challenge1b_input (1).json")
+with p.open("r", encoding="utf-8") as f:
+    input = json.load(f)
+
+persona = input["persona"]["role"]
+task = input["job_to_be_done"]["task"]
+files = str([i["title"] for i in input["documents"]])
+
+
+def generate_queries_with_llm():
+    openai = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+    model="llama3.2",
+    response_format={
+            "type": "json_object"
+    },
+    messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert information retrieval assistant. "
+                    "You specialize in converting user intent into effective search queries "
+                    "for keyword search, semantic search, and reranking systems."
+                    "Return ONLY valid JSON with keys: bm25_query, semantic_query, cross_query. NOTHING ELSE MUST BE RETURNED"
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Given the following inputs:\n\n"
+                    f"Persona: {persona}\n"
+                    f"Job to be done: {task}\n"
+                    f"Document headings: {files}\n(These are the headings of the documents which the ranking pipeline will process)\n"
+                    "Generate THREE queries in JSON format:\n"
+                    "1. bm25_query: short keyword-based query (nouns only, no stopwords)\n"
+                    "2. semantic_query: natural language query capturing full intent\n"
+                    "3. cross_query: concise search-style query suitable for reranking\n\n"
+                    "Return ONLY valid JSON with keys: bm25_query, semantic_query, cross_query. NOTHING ELSE MUST BE RETURNED"
+                )
+            }
+        ]
+    try:
+        chat_completion = openai.chat.completions.create(
+            messages=messages,
+            model='llama3.2', 
+            stream=False,
+        )
+        response = chat_completion.choices[0].message.content.strip()
+        return response
+    except Exception as e:
+        return e
+    
+response = generate_queries_with_llm()
+
+raw = response.strip()
+raw = raw.replace("```json", "").replace("```", "").strip()
+response = json.loads(raw)
+bm25_query = response["bm25_query"]
+if isinstance(bm25_query, list):
+    bm25_query = " ".join(bm25_query)
+semantic_query = str(response["semantic_query"])
+cross_query = str(response["cross_query"])
+
+def process_collection(bm25_query, sem_query, cross_query):
+    all = []
+    for doc in collections:
+        m = Model(doc)
+        tp = len(fitz.open(doc))  # number of pages
+        sections = m.assign_span_sections(tp)
+        if not sections:
+            sections = m.fallback_page_sections()
+        non_empty = [s for s in sections if s["content"].strip()]
+        if (len(non_empty) < 2):
+            continue
+
+        chunks = m.semantic_chunk_sections(sections)
+        bm25 = m.build_bm25_index(chunks)
+        bm25_res = m.bm25_retrieve(bm25, chunks, bm25_query)
+        m.load_embedding_model()
+        emb = m.build_embedding_index(chunks)
+        sem_res = m.embedding_retrieve(emb, chunks, sem_query)
+        candidates = merge(bm25_res[:50], sem_res[:50])
+        m.load_cross_encoder()
+        ranked_chunks = m.cross_encoder_rank(candidates, cross_query, persona, task)
+        ranked_sections = m.aggregate_chunk_into_sections(ranked_chunks)
+
+        for s in ranked_sections:
+            s["document"] = Path(doc).stem
+        all.extend(ranked_sections)
+
+    all.sort(
+        key=lambda x: x["importance_score"],
+        reverse=True
+    )
+
+    for i, s in enumerate(all, start=1):
+        s["importance_rank"] = i
+    return all
+
+all = process_collection(bm25_query, semantic_query, cross_query)
+
+metadata = {
+    "input_documents": [Path(d).stem for d in collections],
+    "persona": persona,
+    "job_to_be_done": task,
+    "processing_timestamp": datetime.now().isoformat()
+}
+
+extracted_sections = []
+for s in all[:5]:
+    extracted_sections.append({
+        "document": s["document"],
+        "section_title": s["section_heading"],
+        "importance_rank": s["importance_rank"],
+        "page_number": s["page_start"] + 1,   # PDFs are 1-indexed
+        "cross_score": s["cross_score"],
+        "semantic_score": s["semantic_score"],
+        "bm25_score": s["bm25_score"]
+    })
+
+def build_refined_text(section, max_chunks=2):
+    chunks = sorted(
+        section["chunks"],
+        key=lambda x: x["cross_score"],
+        reverse=True
+    )[:max_chunks]
+
+    texts = []
+    for c in chunks:
+        texts.append(c["text"].strip())
+
+    return " ".join(texts)
+
+subsection_analysis = []
+
+for s in all[:5]:
+    subsection_analysis.append({
+        "document": s["document"],
+        "refined_text": build_refined_text(s),
+        "page_number": s["page_start"] + 1
+    })
+
+final_output = {
+    "metadata": metadata,
+    "extracted_sections": extracted_sections,
+    "subsection_analysis": subsection_analysis
+}
+
+# evaluation of the output generated
+def extract_eval_material(final_output):
+    sections = final_output.get("extracted_sections", [])
+    subsections = final_output.get("subsection_analysis", [])
+    return sections, subsections
+
+def relevance_agreement_score(extracted_sections):
+    if not extracted_sections:
+        return 0.0
+
+    sem_scores = [s.get("semantic_score", 0.0) for s in extracted_sections]
+    cross_scores = [s.get("cross_score", 0.0) for s in extracted_sections]
+    bm25_scores = [s.get("bm25_score", 0.0) for s in extracted_sections]
+
+    def min_max_norm(vals):
+        vmin, vmax = min(vals), max(vals)
+        if vmax == vmin:
+            return [0.5] * len(vals)
+        return [(v - vmin) / (vmax - vmin) for v in vals]
+
+    sem_norm = min_max_norm(sem_scores)
+    cross_norm = min_max_norm(cross_scores)
+
+    if max(bm25_scores) > 0:
+        bm25_norm = min_max_norm(bm25_scores)
+    else:
+        bm25_norm = [0.0] * len(bm25_scores)
+
+    scores = []
+
+    for s, c, b in zip(sem_norm, cross_norm, bm25_norm):
+        agreement = 1 - abs(s - c)
+
+        strength = (0.45 * s) + (0.45 * c) + (0.10 * b)
+
+        scores.append(
+            0.6 * agreement +
+            0.4 * strength
+        )
+    return sum(scores) / len(scores)
+
+
+
+def job_alignment_score(embed_model, subsection_analysis, job):
+    if not subsection_analysis:
+        return 0.0
+
+    job_emb = embed_model.encode(
+        f"Task: {job}",
+        normalize_embeddings=True
+    )
+
+    sims = []
+    for s in subsection_analysis:
+        text = s.get("refined_text", "").strip()
+        if not text:
+            continue
+
+        text = text[:600]
+
+        emb = embed_model.encode(text, normalize_embeddings=True)
+        sims.append(float(emb @ job_emb))
+
+    if not sims:
+        return 0.0
+
+    return sum(sims) / len(sims)
+
+
+def coherence_penalty(subsections):
+    penalty = 0.0
+
+    for s in subsections:
+        text = s["refined_text"].strip()
+
+        if len(text.split()) < 40:
+            penalty += 0.5
+        if not text or not text[0].isupper():
+            penalty += 0.5
+        if text.count(".") < 2:
+            penalty += 0.5
+
+    return penalty / max(1, len(subsections))
+
+def aggregate_scores(scores):
+    return (
+        0.41 * scores["relevance"] +
+        0.32 * scores["alignment"] +
+        0.27 * (1 - scores["coherence_penalty"])
+    )
+
+def evaluate_pipeline(final_output, job, embed_model=None):
+    sections, subsections = extract_eval_material(final_output)
+    scores = {}
+    scores["relevance"] = relevance_agreement_score(sections)
+
+    if embed_model:
+        scores["alignment"] = job_alignment_score(embed_model, subsections, job)
+    else:
+        scores["alignment"] = 0.5  # neutral fallback
+
+    scores["coherence_penalty"] = coherence_penalty(subsections)
+    scores["final_score"] = aggregate_scores(scores)
+
+    return scores
+
+def filter_sections(sections, min_ratio=0.7, min_count=3):
+    if not sections:
+        return []
+
+    best = sections[0]["importance_score"]
+    filtered = [
+        s for s in sections
+        if s["importance_score"] >= min_ratio * best
+    ]
+
+    # safety fallback: keep top N
+    if len(filtered) < min_count:
+        filtered = sections[:min_count]
+
+    return filtered
+
+print(evaluate_pipeline(final_output, task, embed_model=SentenceTransformer("all-mpnet-base-v2")))
+
+
+output_path = Path("./test/files/collection2/json/output.json")
+with output_path.open("w", encoding="utf-8") as f:
+    json.dump(final_output, f, ensure_ascii=False, indent=4)
