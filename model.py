@@ -1,6 +1,6 @@
 import fitz
 import re
-from main import PDFOutline
+from heading_extraction import PDFOutline
 import json
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -358,18 +358,8 @@ def merge(bm25, semantic):
     return list(merged.values())
 
 
-collections = [str(p) for p in Path("./test/files/collection2").glob("*.pdf")]
 
-p = Path("./test/files/collection2/json/challenge1b_input (1).json")
-with p.open("r", encoding="utf-8") as f:
-    input = json.load(f)
-
-persona = input["persona"]["role"]
-task = input["job_to_be_done"]["task"]
-files = str([i["title"] for i in input["documents"]])
-
-
-def generate_queries_with_llm():
+def generate_queries_with_llm(persona, task, files):
     openai = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
     model="llama3.2",
     response_format={
@@ -411,20 +401,25 @@ def generate_queries_with_llm():
     except Exception as e:
         return e
     
-response = generate_queries_with_llm()
 
-raw = response.strip()
-raw = raw.replace("```json", "").replace("```", "").strip()
-response = json.loads(raw)
-bm25_query = response["bm25_query"]
-if isinstance(bm25_query, list):
-    bm25_query = " ".join(bm25_query)
-semantic_query = str(response["semantic_query"])
-cross_query = str(response["cross_query"])
 
-def process_collection(bm25_query, sem_query, cross_query):
+def build_refined_text(section, max_chunks=2):
+    chunks = sorted(
+        section["chunks"],
+        key=lambda x: x["cross_score"],
+        reverse=True
+    )[:max_chunks]
+
+    texts = []
+    for c in chunks:
+        texts.append(c["text"].strip())
+
+    return " ".join(texts)
+
+def process_collection(pdf_path, persona, task, bm25_query, sem_query, cross_query):
+    # collections = [str(p) for p in Path(pdf_path).glob("*.pdf")]
     all = []
-    for doc in collections:
+    for doc in pdf_path:
         m = Model(doc)
         tp = len(fitz.open(doc))  # number of pages
         sections = m.assign_span_sections(tp)
@@ -448,64 +443,71 @@ def process_collection(bm25_query, sem_query, cross_query):
         for s in ranked_sections:
             s["document"] = Path(doc).stem
         all.extend(ranked_sections)
+    
+    if not all:
+        return {
+            "metadata": {},
+            "extracted_sections": [],
+            "subsection_analysis": []
+        }
 
-    all.sort(
-        key=lambda x: x["importance_score"],
-        reverse=True
-    )
+    all.sort(key=lambda x: x["importance_score"], reverse=True)
 
     for i, s in enumerate(all, start=1):
         s["importance_rank"] = i
-    return all
+    
+    metadata = {
+        "input_documents": [Path(d).stem for d in pdf_path],
+        "persona": persona,
+        "job_to_be_done": task,
+        "processing_timestamp": datetime.now().isoformat()
+    }
 
-all = process_collection(bm25_query, semantic_query, cross_query)
+    extracted_sections = []
+    for s in all[:5]:
+        extracted_sections.append({
+            "document": s["document"],
+            "section_title": s["section_heading"],
+            "importance_rank": s["importance_rank"],
+            "page_number": s["page_start"] + 1,   # PDFs are 1-indexed
+            "cross_score": s["cross_score"],
+            "semantic_score": s["semantic_score"],
+            "bm25_score": s["bm25_score"]
+        })
 
-metadata = {
-    "input_documents": [Path(d).stem for d in collections],
-    "persona": persona,
-    "job_to_be_done": task,
-    "processing_timestamp": datetime.now().isoformat()
-}
+    subsection_analysis = []
 
-extracted_sections = []
-for s in all[:5]:
-    extracted_sections.append({
-        "document": s["document"],
-        "section_title": s["section_heading"],
-        "importance_rank": s["importance_rank"],
-        "page_number": s["page_start"] + 1,   # PDFs are 1-indexed
-        "cross_score": s["cross_score"],
-        "semantic_score": s["semantic_score"],
-        "bm25_score": s["bm25_score"]
-    })
+    for s in all[:5]:
+        subsection_analysis.append({
+            "document": s["document"],
+            "refined_text": build_refined_text(s),
+            "page_number": s["page_start"] + 1
+        })
+    
+    final_output = {
+        "metadata": metadata,
+        "extracted_sections": extracted_sections,
+        "subsection_analysis": subsection_analysis
+    }
 
-def build_refined_text(section, max_chunks=2):
-    chunks = sorted(
-        section["chunks"],
-        key=lambda x: x["cross_score"],
-        reverse=True
-    )[:max_chunks]
+    return final_output
 
-    texts = []
-    for c in chunks:
-        texts.append(c["text"].strip())
+def model_call(pdf_path, persona, task):
+    # collections = [str(p) for p in Path(pdf_path).glob("*.pdf")]
+    files = [Path(d).stem for d in pdf_path]
+    response = generate_queries_with_llm(persona, task, files)
 
-    return " ".join(texts)
+    raw = response.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    response = json.loads(raw)
+    bm25_query = response["bm25_query"]
+    if isinstance(bm25_query, list):
+        bm25_query = " ".join(bm25_query)
+    semantic_query = str(response["semantic_query"])
+    cross_query = str(response["cross_query"])
+    output = process_collection(pdf_path, persona, task, bm25_query, semantic_query, cross_query)
+    return output
 
-subsection_analysis = []
-
-for s in all[:5]:
-    subsection_analysis.append({
-        "document": s["document"],
-        "refined_text": build_refined_text(s),
-        "page_number": s["page_start"] + 1
-    })
-
-final_output = {
-    "metadata": metadata,
-    "extracted_sections": extracted_sections,
-    "subsection_analysis": subsection_analysis
-}
 
 # evaluation of the output generated
 def extract_eval_material(final_output):
@@ -629,9 +631,11 @@ def filter_sections(sections, min_ratio=0.7, min_count=3):
 
     return filtered
 
-print(evaluate_pipeline(final_output, task, embed_model=SentenceTransformer("all-mpnet-base-v2")))
+# print(evaluate_pipeline(final_output, task, embed_model=SentenceTransformer("all-mpnet-base-v2")))
 
 
-output_path = Path("./test/files/collection2/json/output.json")
-with output_path.open("w", encoding="utf-8") as f:
-    json.dump(final_output, f, ensure_ascii=False, indent=4)
+# output_path = Path("./test/files/collection2/json/output.json")
+# with output_path.open("w", encoding="utf-8") as f:
+#     json.dump(final_output, f, ensure_ascii=False, indent=4)
+
+

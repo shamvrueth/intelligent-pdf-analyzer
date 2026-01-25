@@ -209,3 +209,16 @@ __marimo__/
 
 test/
 models/
+
+# FastAPI / server logs
+*.log
+uvicorn.log
+gunicorn.log
+
+# FastAPI / Pydantic
+__pydantic__/
+
+# Environment configs
+.env.local
+.env.dev
+.env.prod

@@ -1,7 +1,7 @@
 import csv
 import json
 from pathlib import Path
-from main import PDFOutline
+from heading_extraction import PDFOutline
 
 class PrepareCSV:
     def __init__(self, pdf_path, output_path):
